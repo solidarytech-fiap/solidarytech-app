@@ -1,0 +1,30 @@
+# Checks ignorados com justificativa (AWS Academy / custo do ambiente academico).
+skip-check:
+  - CKV_AWS_338   # CloudWatch log retention >= 1 ano (custo)
+  - CKV_AWS_157   # RDS Multi-AZ (decisao FinOps documentada; donation recomendado em prod real)
+  - CKV_AWS_161   # RDS IAM auth (sem IRSA no Academy)
+  - CKV_AWS_118   # RDS enhanced monitoring (custo)
+  - CKV_AWS_353   # RDS Performance Insights (custo)
+  - CKV_AWS_293   # RDS deletion protection (ambiente destruido entre sessoes)
+  - CKV_AWS_144   # S3 cross-region replication (o bucket JA esta na regiao de DR)
+  - CKV_AWS_145   # S3 KMS CMK (SSE-S3 suficiente; KMS CMK tem custo)
+  - CKV_AWS_18    # S3 access logging (custo)
+  - CKV_AWS_339   # EKS 1.36 esta no range suportado da AWS; checkov pode nao ter o banco atualizado
+  - CKV_AWS_341   # Hop limit = 2 e necessario para pods acessarem IMDSv2 via node (sem IRSA no Academy)
+  - CKV_AWS_394   # aws_availability_zones ja tem zone-type + opt-in-status (checkov so aceita padroes especificos)
+  - CKV2_AWS_62   # S3 event notifications
+  - CKV_AWS_136   # ECR KMS CMK
+  - CKV_AWS_119   # DynamoDB KMS CMK
+  - CKV_AWS_27    # SQS KMS CMK (SSE gerenciado pela SQS habilitado)
+  - CKV_AWS_337   # SSM KMS CMK (usa aws/ssm)
+  - CKV_AWS_39    # EKS endpoint publico (necessario para GitHub Actions hosted runners)
+  - CKV_AWS_38    # EKS public CIDR 0.0.0.0/0 (runners do GitHub sem IP fixo)
+  - CKV_AWS_58    # EKS secrets encryption KMS (sem permissao de KMS CMK no Academy)
+  - CKV_AWS_130   # Subnet publica com IP publico (nodes sem NAT - decisao FinOps)
+  - CKV2_AWS_11   # VPC flow logs (custo)
+  - CKV2_AWS_5    # SG anexado (falso positivo com modulos)
+  - CKV2_AWS_30   # RDS query logging
+  - CKV2_AWS_60   # RDS copy tags (ja habilitado)
+  - CKV2_AWS_61   # S3 lifecycle (falso positivo - existe em recurso separado)
+  - CKV2_AWS_69   # RDS encryption in transit (rds.force_ssl=1 no parameter group)
+  - CKV2_AWS_34   # SSM String sem criptografia (somente config nao sensivel)

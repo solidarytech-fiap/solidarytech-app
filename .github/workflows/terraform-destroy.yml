@@ -1,0 +1,94 @@
+name: Terraform Destroy (economia de creditos)
+
+# Ordem inversa. Antes do compute, remove os Load Balancers criados pelo
+# Kubernetes (ingress-nginx / argocd-server). Sem isso, os ELBs/ENIs ficam
+# presos na VPC e o destroy do networking falha com DependencyViolation.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Digite "destroy" para confirmar'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-prod
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - if: inputs.confirm != 'destroy'
+        run: |
+          echo "::error::Confirmacao invalida. Digite exatamente: destroy"
+          exit 1
+
+  cleanup-k8s:
+    name: Remover LoadBalancers do cluster
+    needs: guard
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+      - name: Deletar Applications e Services LoadBalancer
+        run: |
+          set -x
+          aws eks update-kubeconfig --name solidarytech-eks --region us-east-1 || exit 0
+          # Remove a raiz do App-of-Apps sem cascata e depois os LBs.
+          kubectl -n argocd patch application root -p '{"metadata":{"finalizers":null}}' --type merge || true
+          kubectl -n argocd delete application --all --wait=false || true
+          kubectl get svc -A -o json \
+            | jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace) \(.metadata.name)"' \
+            | while read -r ns name; do kubectl -n "$ns" delete svc "$name" --wait=true --timeout=180s || true; done
+          sleep 60
+
+  finops:
+    needs: [guard, cleanup-k8s]
+    if: always() && needs.guard.result == 'success'
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: finops, action: destroy, continue-on-error: true }
+    secrets: inherit
+
+  compute:
+    needs: [guard, finops]
+    if: always() && needs.guard.result == 'success'
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: compute, action: destroy }
+    secrets: inherit
+
+  platform:
+    needs: [guard, finops]
+    if: always() && needs.guard.result == 'success'
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: platform, action: destroy }
+    secrets: inherit
+
+  data:
+    needs: [guard, finops]
+    if: always() && needs.guard.result == 'success'
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: data, action: destroy }
+    secrets: inherit
+
+  security:
+    needs: [guard, data]
+    if: always() && needs.guard.result == 'success'
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: security, action: destroy }
+    secrets: inherit
+
+  networking:
+    needs: [guard, compute, platform, data, security]
+    if: always() && needs.guard.result == 'success'
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: networking, action: destroy }
+    secrets: inherit

@@ -1,0 +1,89 @@
+name: Reusable Go CI (test, lint, SAST, SCA)
+
+on:
+  workflow_call:
+    inputs:
+      service-path:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test:
+    name: Test (race + coverage)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x" # ultimo patch: correcoes de seguranca da stdlib
+          cache-dependency-path: ${{ inputs.service-path }}/go.sum
+      - run: go vet ./...
+      - run: go test -race -coverprofile=coverage.out ./...
+      - run: go tool cover -func=coverage.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x" # ultimo patch: correcoes de seguranca da stdlib
+          cache-dependency-path: ${{ inputs.service-path }}/go.sum
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: ${{ inputs.service-path }}
+
+  sast:
+    name: SAST (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x" # ultimo patch: correcoes de seguranca da stdlib
+          cache-dependency-path: ${{ inputs.service-path }}/go.sum
+      - name: gosec
+        working-directory: ${{ inputs.service-path }}
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          # Falha em achados de severidade HIGH.
+          gosec -severity high -confidence medium -fmt sarif -out gosec.sarif -stdout -verbose=text ./...
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: ${{ inputs.service-path }}/gosec.sarif
+          category: gosec-${{ inputs.service-path }}
+
+  sca:
+    name: SCA (govulncheck + Trivy fs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x" # ultimo patch: correcoes de seguranca da stdlib
+          cache-dependency-path: ${{ inputs.service-path }}/go.sum
+      - name: govulncheck (vulnerabilidades alcancaveis no codigo)
+        working-directory: ${{ inputs.service-path }}
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: Trivy fs (dependencias + segredos)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.service-path }}
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

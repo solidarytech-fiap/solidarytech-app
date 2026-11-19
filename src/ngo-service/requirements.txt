@@ -1,4 +1,13 @@
-Flask==2.2.2
-psycopg2-binary==2.9.5
-gunicorn==20.1.0
-python-dotenv==0.21.0
+Flask==3.1.3
+Werkzeug==3.1.9
+psycopg2-binary==2.9.13
+gunicorn==23.0.0
+python-dotenv==1.2.4
+prometheus-client==0.26.0
+# OpenTelemetry: auto-instrumentacao via CLI 'opentelemetry-instrument'.
+# Configuracao pelas envs OTEL_* do manifesto Kubernetes.
+opentelemetry-distro==0.66b2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-instrumentation-flask==0.66b2
+opentelemetry-instrumentation-psycopg2==0.66b2
+opentelemetry-instrumentation-logging==0.66b2

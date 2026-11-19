@@ -1,0 +1,95 @@
+name: Terraform Apply (infra completa)
+
+# Ordem das camadas:
+#   networking -> security -> data | platform | compute -> finops
+#   -> dispara a instalacao do ArgoCD no repo solidarytech-deploy
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "plan ou apply"
+        type: choice
+        options: [plan, apply]
+        default: apply
+      trigger_argocd:
+        description: "Disparar instalacao do ArgoCD ao final"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-prod
+  cancel-in-progress: false
+
+jobs:
+  networking:
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: networking, action: "${{ inputs.action }}" }
+    secrets: inherit
+
+  security:
+    needs: networking
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: security, action: "${{ inputs.action }}" }
+    secrets: inherit
+
+  data:
+    needs: [networking, security]
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: data, action: "${{ inputs.action }}" }
+    secrets: inherit
+
+  platform:
+    needs: networking
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: platform, action: "${{ inputs.action }}" }
+    secrets: inherit
+
+  compute:
+    needs: networking
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: compute, action: "${{ inputs.action }}" }
+    secrets: inherit
+
+  # Budgets pode ser negado no AWS Academy -> nao bloqueia o pipeline.
+  finops:
+    needs: [data, platform, compute]
+    uses: ./.github/workflows/reusable-terraform.yml
+    with: { layer: finops, action: "${{ inputs.action }}", continue-on-error: true }
+    secrets: inherit
+
+  tag-compliance:
+    name: Relatorio de tags FinOps
+    needs: [data, platform, compute]
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+      - name: Recursos com tag Project=SolidaryTech
+        run: ./scripts/check-tags.sh >> "$GITHUB_STEP_SUMMARY"
+
+  trigger-argocd:
+    name: Disparar ArgoCD install (solidarytech-deploy)
+    needs: [data, platform, compute]
+    if: inputs.action == 'apply' && inputs.trigger_argocd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITOPS_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: 'solidarytech-fiap',
+              repo: 'solidarytech-deploy',
+              workflow_id: 'argocd-install.yml',
+              ref: 'main'
+            });
+            core.notice('argocd-install.yml disparado em solidarytech-deploy');

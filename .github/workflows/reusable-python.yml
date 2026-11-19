@@ -1,0 +1,77 @@
+name: Reusable Python CI (test, lint, SAST, SCA)
+
+on:
+  workflow_call:
+    inputs:
+      service-path:
+        required: true
+        type: string
+      python-version:
+        required: false
+        type: string
+        default: "3.12" # alinhado com python:3.12-slim do Dockerfile
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.service-path }}/requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -v
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: pip install ruff
+      - run: ruff check --select E9,F,B --ignore E501 ${{ inputs.service-path }}
+
+  sast:
+    name: SAST (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: pip install bandit
+      # -ll: falha em severidade MEDIUM ou maior.
+      - run: bandit -r ${{ inputs.service-path }} -ll -x ${{ inputs.service-path }}/tests
+
+  sca:
+    name: SCA (pip-audit + Trivy fs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: pip install pip-audit
+      - name: pip-audit
+        run: pip-audit -r ${{ inputs.service-path }}/requirements.txt
+      - name: Trivy fs (dependencias + segredos)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.service-path }}
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

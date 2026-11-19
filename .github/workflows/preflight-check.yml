@@ -1,0 +1,53 @@
+name: Preflight Check (rodar no inicio de cada sessao AWS Academy)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Secrets obrigatorios presentes
+        env:
+          AK: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SK: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          ST: ${{ secrets.AWS_SESSION_TOKEN }}
+          BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          GT: ${{ secrets.GITOPS_TOKEN }}
+          BE: ${{ secrets.BUDGET_EMAILS }}
+        run: |
+          fail=0
+          for v in AK SK ST BUCKET GT; do
+            if [ -z "${!v}" ]; then echo "::error::secret ausente: $v"; fail=1; else echo "ok: $v"; fi
+          done
+          [ -z "$BE" ] && echo "::warning::BUDGET_EMAILS ausente (camada finops vai falhar)"
+          exit $fail
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Credenciais AWS validas (nao expiradas)
+        run: aws sts get-caller-identity
+
+      - name: Bucket de state acessivel
+        run: aws s3api head-bucket --bucket "${{ secrets.TF_STATE_BUCKET }}"
+
+      - name: LabRole existe (necessaria para EKS)
+        run: aws iam get-role --role-name LabRole --query Role.Arn --output text
+
+      - name: Token GitOps com acesso ao repo deploy
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: gh api repos/solidarytech-fiap/solidarytech-deploy --jq .full_name
+
+      - name: Parametro Datadog (opcional ate a semana 7)
+        run: |
+          aws ssm get-parameter --name /solidarytech/prod/datadog/api-key --query Parameter.Name --output text \
+            || echo "::notice::Datadog API key ainda nao cadastrada no SSM (ok antes da semana 7)"

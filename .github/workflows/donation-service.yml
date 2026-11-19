@@ -1,0 +1,33 @@
+name: donation-service
+
+on:
+  pull_request:
+    paths: ["src/donation-service/**", ".github/workflows/donation-service.yml", ".github/workflows/reusable-go.yml", ".github/workflows/reusable-docker.yml"]
+  push:
+    branches: [main]
+    paths: ["src/donation-service/**", ".github/workflows/donation-service.yml", ".github/workflows/reusable-go.yml", ".github/workflows/reusable-docker.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: donation-service-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-go.yml
+    with:
+      service-path: src/donation-service
+
+  # Em PR: build + Trivy sem push. Em main: push no ECR + GitOps.
+  docker:
+    needs: ci
+    uses: ./.github/workflows/reusable-docker.yml
+    with:
+      service-path: src/donation-service
+      image-name: donation-service
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit

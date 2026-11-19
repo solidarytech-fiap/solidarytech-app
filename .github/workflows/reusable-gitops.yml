@@ -1,0 +1,51 @@
+name: Reusable GitOps Update
+
+# Atualiza a imagem no overlay de producao do repo solidarytech-deploy.
+# O ArgoCD detecta o commit e faz o rollout (nenhum kubectl apply manual).
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        required: true
+        type: string
+      image:
+        description: "registry/repositorio (sem tag)"
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: solidarytech-fiap/solidarytech-deploy
+          ref: main
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: kustomize edit set image
+        working-directory: k8s/overlays/prod
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.4.3 /tmp
+          /tmp/kustomize edit set image "${{ inputs.image-name }}=${{ inputs.image }}:${{ inputs.tag }}"
+          git diff
+
+      - name: Commit e push (com retry para pushes concorrentes)
+        run: |
+          git config user.name  "solidarytech-ci"
+          git config user.email "ci@solidarytech.local"
+          git add k8s/overlays/prod/kustomization.yaml
+          git diff --cached --quiet && { echo "sem mudancas"; exit 0; }
+          git commit -m "deploy(${{ inputs.image-name }}): ${{ inputs.tag }}" \
+                     -m "Origem: ${{ github.server_url }}/${{ github.repository }}/commit/${{ inputs.tag }}"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep $((i * 3))
+          done
+          exit 1

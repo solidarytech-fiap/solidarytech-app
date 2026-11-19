@@ -1,0 +1,103 @@
+name: Reusable Docker (build, Trivy image, push ECR, GitOps)
+
+on:
+  workflow_call:
+    inputs:
+      service-path:
+        required: true
+        type: string
+      image-name:
+        required: true
+        type: string
+      push:
+        description: "false em PR: so build + scan"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  image:
+    name: Build + scan + push
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (local)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.service-path }}
+          load: true
+          tags: ${{ inputs.image-name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
+
+      - name: Tamanho da imagem
+        run: docker image ls ${{ inputs.image-name }}:${{ github.sha }} --format '{{.Repository}}:{{.Tag}} {{.Size}}' >> "$GITHUB_STEP_SUMMARY"
+
+      # Bloqueia o deploy se houver vulnerabilidade CRITICAL corrigivel.
+      - name: Trivy image (gate)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: image
+          image-ref: ${{ inputs.image-name }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Trivy image (relatorio SARIF HIGH+)
+        if: always()
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: image
+          image-ref: ${{ inputs.image-name }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-${{ inputs.image-name }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: inputs.push
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Login ECR
+        if: inputs.push
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push (tag = commit SHA, imutavel)
+        if: inputs.push
+        id: meta
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ inputs.image-name }}"
+          docker tag ${{ inputs.image-name }}:${{ github.sha }} "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Publicado: \`$IMAGE:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  gitops:
+    name: Atualizar tag no solidarytech-deploy
+    needs: image
+    if: inputs.push
+    uses: ./.github/workflows/reusable-gitops.yml
+    with:
+      image-name: ${{ inputs.image-name }}
+      image: ${{ needs.image.outputs.image }}
+      tag: ${{ github.sha }}
+    secrets: inherit

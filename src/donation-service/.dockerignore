@@ -1,0 +1,6 @@
+.env
+.env.*
+*_test.go
+donation-service
+Dockerfile
+.dockerignore

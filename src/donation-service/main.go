@@ -1,139 +1,140 @@
 package main
 
 import (
+	"context"
 	"database/sql"
-	"encoding/json"
-	"log"
+	"errors"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
-	_ "github.com/jackc/pgx/v4/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-type Donation struct {
-	ID        int       `json:"id"`
-	NgoID     int       `json:"ngo_id"`
-	Amount    float64   `json:"amount"`
-	DonorName string    `json:"donor_name"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-type App struct {
-	DB          *sql.DB
-	SqsSvc      *sqs.SQS
-	SqsQueueURL string
-}
+const serviceName = "donation-service"
 
 func main() {
 	_ = godotenv.Load()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8082"
+	// Logs estruturados em JSON (Loki/Datadog fazem parse automatico).
+	logger := slog.New(traceHandler{slog.NewJSONHandler(os.Stdout, nil)}).With("service", serviceName)
+	slog.SetDefault(logger)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	shutdownOTel, err := initOTel(ctx, serviceName)
+	if err != nil {
+		slog.Error("falha ao iniciar OpenTelemetry", "error", err)
+		os.Exit(1)
 	}
+
+	port := getenv("PORT", "8082")
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		log.Fatal("DATABASE_URL é obrigatória")
+		slog.Error("DATABASE_URL e obrigatoria")
+		os.Exit(1)
 	}
 
-	db, err := sql.Open("pgx", dbURL)
-	if err != nil || db.Ping() != nil {
-		log.Fatalf("Erro ao conectar ao banco de dados: %v", err)
+	db, err := openDB(dbURL)
+	if err != nil {
+		slog.Error("erro ao conectar ao banco de dados", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Conectado ao PostgreSQL (donation-service).")
+	slog.Info("conectado ao PostgreSQL")
 
-	var sqsSvc *sqs.SQS
+	var sqsSvc SQSSender
 	queueURL := os.Getenv("AWS_SQS_URL")
 	region := os.Getenv("AWS_REGION")
 	if queueURL != "" && region != "" {
-		sess, _ := session.NewSession(&aws.Config{Region: aws.String(region)})
+		cfg := &aws.Config{Region: aws.String(region)}
+		// Permite LocalStack no ambiente local (docker compose).
+		if ep := os.Getenv("AWS_ENDPOINT_URL"); ep != "" {
+			cfg.Endpoint = aws.String(ep)
+		}
+		sess, err := session.NewSession(cfg)
+		if err != nil {
+			slog.Error("erro ao criar sessao AWS", "error", err)
+			os.Exit(1)
+		}
 		sqsSvc = sqs.New(sess)
-		log.Println("Integração com AWS SQS ativada.")
+		slog.Info("integracao com AWS SQS ativada", "queue", queueURL)
 	}
 
-	app := &App{DB: db, SqsSvc: sqsSvc, SqsQueueURL: queueURL}
+	app := NewApp(db, sqsSvc, queueURL, os.Getenv("CHAOS_TOKEN"))
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", app.HealthHandler)
-	mux.HandleFunc("/donations", app.DonationHandler)
-
-	log.Printf("donation-service rodando na porta %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
-}
-
-func (a *App) HealthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok","service":"donation-service"}`))
-}
-
-func (a *App) DonationHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method == http.MethodPost {
-		var d Donation
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
-			http.Error(w, `{"error":"Payload inválido"}`, http.StatusBadRequest)
-			return
-		}
-
-		d.Status = "APPROVED" // Simulação de gateway de pagamento
-		err := a.DB.QueryRow(
-			"INSERT INTO donations (ngo_id, amount, donor_name, status) VALUES ($1, $2, $3, $4) RETURNING id, created_at",
-			d.NgoID, d.Amount, d.DonorName, d.Status,
-		).Scan(&d.ID, &d.CreatedAt)
-
-		if err != nil {
-			log.Printf("Erro ao salvar doação: %v", err)
-			http.Error(w, `{"error":"Erro interno"}`, http.StatusInternalServerError)
-			return
-		}
-
-		if a.SqsSvc != nil {
-			go a.sendNotificationEvent(d)
-		}
-
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(d)
-		return
+	srv := &http.Server{
+		Addr: ":" + port,
+		Handler: otelhttp.NewHandler(app.Routes(promhttp.Handler()), serviceName,
+			// Probes e scrape nao geram spans (ruido e custo no APM).
+			otelhttp.WithFilter(func(r *http.Request) bool {
+				switch r.URL.Path {
+				case "/health", "/ready", "/metrics":
+					return false
+				}
+				return true
+			}),
+		),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
-	if r.Method == http.MethodGet {
-		rows, err := a.DB.Query("SELECT id, ngo_id, amount, donor_name, status, created_at FROM donations ORDER BY id DESC")
-		if err != nil {
-			http.Error(w, `{"error":"Erro interno"}`, http.StatusInternalServerError)
-			return
+	go func() {
+		slog.Info("donation-service iniciado", "port", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("erro no servidor HTTP", "error", err)
+			os.Exit(1)
 		}
-		defer rows.Close()
+	}()
 
-		donations := []Donation{}
-		for rows.Next() {
-			var d Donation
-			rows.Scan(&d.ID, &d.NgoID, &d.Amount, &d.DonorName, &d.Status, &d.CreatedAt)
-			donations = append(donations, d)
-		}
+	// Graceful shutdown: o Kubernetes envia SIGTERM antes de matar o pod.
+	<-ctx.Done()
+	slog.Info("sinal de parada recebido, encerrando")
+	app.SetReady(false)
 
-		json.NewEncoder(w).Encode(donations)
-		return
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("erro no shutdown HTTP", "error", err)
 	}
-
-	http.Error(w, `{"error":"Método não permitido"}`, http.StatusMethodNotAllowed)
+	app.Wait()
+	_ = db.Close()
+	_ = shutdownOTel(shutdownCtx)
+	slog.Info("encerrado")
 }
 
-func (a *App) sendNotificationEvent(d Donation) {
-	body, _ := json.Marshal(d)
-	_, err := a.SqsSvc.SendMessage(&sqs.SendMessageInput{
-		MessageBody: aws.String(string(body)),
-		QueueUrl:    aws.String(a.SqsQueueURL),
-	})
+func openDB(url string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", url)
 	if err != nil {
-		log.Printf("Falha ao despachar evento SQS: %v", err)
+		return nil, err
 	}
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
